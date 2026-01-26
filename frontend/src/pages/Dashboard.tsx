@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../AuthContext";
-import { listEligible, markChecked } from "../api";
+import { listEligible, markChecked, UploadFilePayload } from "../api";
 import ApprovalCard from "../components/ApprovalCard";
 import Button from "../components/Button";
 import Loader from "../components/Loader";
@@ -19,6 +19,8 @@ export default function DashboardPage() {
   const [search, setSearch] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [busyMap, setBusyMap] = useState<Record<string, boolean>>({});
+  const [pendingItem, setPendingItem] = useState<EligibleItem | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const itemKey = useCallback(
     (item: EligibleItem) =>
@@ -43,10 +45,12 @@ export default function DashboardPage() {
     setLoading(true);
     try {
       const result = await listEligible(token);
-      setItems((result.items || []) as EligibleItem[]);
+      const nextItems = (result.items || []) as EligibleItem[];
+      setItems(nextItems);
       if (result.email) {
         setEmail(result.email);
       }
+      return nextItems;
     } catch (error: any) {
       const message = error?.message || "Unable to load approvals";
       addToast(message, "error");
@@ -57,6 +61,7 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
+    return null;
   }, [addToast, logout, navigate, setEmail, token]);
 
   const filteredItems = useMemo(() => {
@@ -89,16 +94,40 @@ export default function DashboardPage() {
     }
   };
 
-  const handleMarkChecked = async (item: EligibleItem) => {
+  const readFileAsDataUrl = (file: File) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error(`Unable to read ${file.name}`));
+      reader.readAsDataURL(file);
+    });
+
+  const submitMarkChecked = async (item: EligibleItem, files: File[]) => {
     if (!token) {
       return;
     }
     const key = itemKey(item);
     setBusyMap((prev) => ({ ...prev, [key]: true }));
     try {
-      await markChecked(token, item.orderId, item.segmentIndex, item.rowIndex);
-      addToast("Marked as checked", "success");
-      await loadItems();
+      const payloadFiles: UploadFilePayload[] = await Promise.all(
+        files.map(async (file) => ({
+          name: file.name,
+          type: file.type || "application/octet-stream",
+          data: await readFileAsDataUrl(file)
+        }))
+      );
+
+      await markChecked(token, item.orderId, item.segmentIndex, item.rowIndex, payloadFiles);
+      const nextItems = await loadItems();
+      const stillPending = nextItems
+        ? nextItems.some((next) => itemKey(next) === key)
+        : true;
+
+      if (stillPending) {
+        addToast("Unable to confirm update. Please retry.", "error");
+      } else {
+        addToast("Marked as checked", "success");
+      }
     } catch (error: any) {
       addToast(error?.message || "Unable to update approval", "error");
     } finally {
@@ -108,6 +137,32 @@ export default function DashboardPage() {
         return next;
       });
     }
+  };
+
+  const handleMarkChecked = (item: EligibleItem) => {
+    if (!fileInputRef.current) {
+      addToast("File attachment is required", "error");
+      return;
+    }
+    setPendingItem(item);
+    fileInputRef.current.value = "";
+    fileInputRef.current.click();
+  };
+
+  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    const item = pendingItem;
+    setPendingItem(null);
+
+    if (!item) {
+      return;
+    }
+    if (!files.length) {
+      addToast("Attachment is required to mark checked", "error");
+      return;
+    }
+
+    await submitMarkChecked(item, files);
   };
 
   useEffect(() => {
@@ -136,6 +191,13 @@ export default function DashboardPage() {
       </header>
 
       <main className="mx-auto mt-8 w-full max-w-6xl px-6">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="sr-only"
+          onChange={handleFileChange}
+        />
         <section className="grid gap-6 md:grid-cols-[1.2fr_2fr]">
           <div className="glass-card p-6">
             <p className="text-xs uppercase tracking-[0.3em] text-ink-500">Pending Cards</p>

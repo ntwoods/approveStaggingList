@@ -6,6 +6,12 @@ export type JsonpResponse = {
   updatedApprovals?: string;
 };
 
+export type UploadFilePayload = {
+  name: string;
+  type: string;
+  data: string;
+};
+
 const API_URL = import.meta.env.VITE_GAS_WEBAPP_URL as string | undefined;
 
 function ensureApiUrl() {
@@ -82,19 +88,24 @@ export async function markChecked(
   idToken: string,
   orderId: string,
   segmentIndex: number,
-  rowIndex?: number
+  rowIndex?: number,
+  files: UploadFilePayload[] = []
 ) {
   const url = ensureApiUrl();
-  const result = (await jsonp(url, {
+  const payload = {
     action: "markChecked",
     id_token: idToken,
     orderId,
     segmentIndex,
-    rowIndex
-  })) as JsonpResponse;
+    rowIndex,
+    files
+  };
 
-  if (!result?.ok) {
-    throw new Error(result?.error || "Failed to mark approval");
-  }
-  return result;
+  await fetch(url, {
+    method: "POST",
+    mode: "no-cors",
+    body: JSON.stringify(payload)
+  });
+
+  return { ok: true };
 }
