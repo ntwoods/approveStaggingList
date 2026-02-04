@@ -92,20 +92,40 @@ export async function markChecked(
   files: UploadFilePayload[] = []
 ) {
   const url = ensureApiUrl();
-  const payload = {
-    action: "markChecked",
-    id_token: idToken,
-    orderId,
-    segmentIndex,
-    rowIndex,
-    files
-  };
+  const body = new URLSearchParams();
+  body.set("action", "markChecked");
+  body.set("id_token", idToken);
+  body.set("orderId", orderId);
+  body.set("segmentIndex", String(segmentIndex));
+  if (rowIndex !== undefined) {
+    body.set("rowIndex", String(rowIndex));
+  }
+  body.set("files", JSON.stringify(files));
 
-  await fetch(url, {
-    method: "POST",
-    mode: "no-cors",
-    body: JSON.stringify(payload)
-  });
+  // Apps Script Web Apps often do not set CORS headers. Using `no-cors` avoids
+  // relying on reading the response (send-only).
+  await fetch(url, { method: "POST", body, mode: "no-cors" });
+  return { ok: true, opaque: true };
+}
 
-  return { ok: true };
+export async function returnToManager(
+  idToken: string,
+  orderId: string,
+  segmentIndex: number,
+  remark: string,
+  rowIndex?: number
+) {
+  const url = ensureApiUrl();
+  const body = new URLSearchParams();
+  body.set("action", "returnToManager");
+  body.set("id_token", idToken);
+  body.set("orderId", orderId);
+  body.set("segmentIndex", String(segmentIndex));
+  body.set("remark", remark);
+  if (rowIndex !== undefined) {
+    body.set("rowIndex", String(rowIndex));
+  }
+
+  await fetch(url, { method: "POST", body, mode: "no-cors" });
+  return { ok: true, opaque: true };
 }

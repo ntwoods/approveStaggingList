@@ -9,16 +9,27 @@ const variants: Record<string, string> = {
   ghost: "bg-transparent text-ink-700 hover:bg-brand-100"
 };
 
+const sizes = {
+  md: "",
+  sm: "!px-3 !py-1.5",
+  xs: "!px-2 !py-1 !text-xs"
+} as const;
+
 type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: keyof typeof variants;
+  size?: keyof typeof sizes;
 };
 
 export default function Button({
   variant = "primary",
+  size = "md",
   className = "",
   ...props
 }: ButtonProps) {
   return (
-    <button className={`${baseClasses} ${variants[variant]} ${className}`} {...props} />
+    <button
+      className={`${baseClasses} ${variants[variant]} ${sizes[size]} ${className}`}
+      {...props}
+    />
   );
 }

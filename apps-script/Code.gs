@@ -6,9 +6,29 @@ var ATTACHMENTS_COLUMN = columnToIndex_("BH");
 var ATTACHMENTS_FOLDER_NAME = "ApprovedSalesOrders";
 var DASH_KEY = "EA_DASH_KEY_CHANGE_ME";
 
+// Returned-by-EA markers (shared with StagingList manager portal)
+var RETURN_STATE_HEADER = "EA_SEGMENT_STATE";
+var RETURN_REMARK_HEADER = "EA_SEGMENT_REMARK";
+var RETURNED_AT_HEADER = "EA_SEGMENT_RETURNED_AT";
+
+var EA_SEGMENT_STATE = {
+  RETURNED: "RETURNED_BY_EA",
+  PENDING: "PENDING_EA_APPROVAL",
+  APPROVED: "APPROVED_BY_EA"
+};
+
+// Used only for manager integration (segmentUrl computation)
+var FINAL_URL_COLUMN = columnToIndex_("O");
+var ADDITIONAL_URLS_COLUMN = columnToIndex_("AC");
+
 
 // NOTE: mapping exactly same rakha hai (logic untouched)
 var APPROVAL_COLUMN_BY_EMAIL = {
+  // Primary EAs
+  "ea01@ntwoods.com": "BF",
+  "ea02@ntwoods.com": "BG",
+
+  // Backward compatibility (older org email used in some deployments)
   "mis01@ntwoods.com": "BF"
 };
 
@@ -30,6 +50,8 @@ var COLUMN_INDEX = {
 var __ss = null;
 var __sheet = null;
 var __logSheet = null;
+var __returnLogSheet = null;
+var __headerColIndexCache = {};
 
 function doGet(e) { return handleRequest_(e); }
 function doPost(e) { return handleRequest_(normalizeEvent_(e)); }
@@ -43,16 +65,23 @@ function handleRequest_(e) {
     if (action === "listEligible") {
       result = listEligible_(e);
     } else if (action === "COUNT_ELIGIBLE") {
-  var key = (e && e.parameter && e.parameter.key) || "";
-  if (!key || String(key).trim() !== DASH_KEY) {
-    throw new Error("Access denied");
-  }
-  // eligible list already aati hai listEligible_ me, but it requires id_token,
-  // so we need a token-less count function
-  result = countEligible_(); 
-}
-else if (action === "markChecked") {
+      var key = (e && e.parameter && e.parameter.key) || "";
+      if (!key || String(key).trim() !== DASH_KEY) {
+        throw new Error("Access denied");
+      }
+      // eligible list already aati hai listEligible_ me, but it requires id_token,
+      // so we need a token-less count function.
+      // Optional: pass `email=ea01@...` or `email=ea02@...` to count for that EA.
+      var countEmail = normalizeCell_(e && e.parameter && e.parameter.email);
+      result = countEligible_(countEmail);
+    } else if (action === "markChecked") {
       result = markChecked_(e);
+    } else if (action === "returnToManager") {
+      result = returnToManager_(e);
+    } else if (action === "listReturnedForManager") {
+      result = listReturnedForManager_(e);
+    } else if (action === "clearReturnedForManager") {
+      result = clearReturnedForManager_(e);
     } else {
       throw new Error("Unknown action");
     }
@@ -63,14 +92,21 @@ else if (action === "markChecked") {
   return createOutput_(callback, result);
 }
 
-function countEligible_() {
+function countEligible_(email) {
   var sheet = getSheet_();
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return { ok: true, count: 0 };
 
-  // NOTE: approvals BF column (mis01) is fixed for dashboard count
-  // (because dashboard is for EA Shaista only)
-  var approvalIndex = columnToIndex_(APPROVAL_COLUMN_BY_EMAIL["mis01@ntwoods.com"]); // BF -> 58
+  var approvalEmail = email && APPROVAL_COLUMN_BY_EMAIL[email] ? email : "ea01@ntwoods.com";
+  if (!APPROVAL_COLUMN_BY_EMAIL[approvalEmail]) {
+    // fallback (older deployments)
+    approvalEmail = "mis01@ntwoods.com";
+  }
+
+  var approvalIndex = columnToIndex_(APPROVAL_COLUMN_BY_EMAIL[approvalEmail]);
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
+
   var maxCol = Math.max(
     approvalIndex,
     COLUMN_INDEX.orderId,
@@ -79,6 +115,7 @@ function countEligible_() {
   );
 
   var data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+  var statesColValues = sheet.getRange(2, stateCol, lastRow - 1, 1).getValues();
 
   var idxOrderId = COLUMN_INDEX.orderId - 1;
   var idxAQ = COLUMN_INDEX.aq - 1;
@@ -96,11 +133,13 @@ function countEligible_() {
     var aq = normalizeCell_(row[idxAQ]);
     var ar = normalizeCell_(row[idxAR]);
     var approvalsValue = normalizeCell_(row[idxApproval]);
+    var statesValue = normalizeCell_(statesColValues[i][0]);
 
     var segments = buildSegments_(aq, ar);
     var approvals = splitApprovals_(approvalsValue);
+    var states = splitPipe_(statesValue);
 
-    var pendingIndex = findPendingSegmentIndex_(segments, approvals);
+    var pendingIndex = findPendingSegmentIndex_(segments, approvals, states);
     if (pendingIndex === null) continue;
 
     count++;
@@ -124,6 +163,8 @@ function listEligible_(e) {
   if (lastRow < 2) return { ok: true, email: auth.email, items: [] };
 
   var approvalIndex = approvalColumnIndex_(auth.email);
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
 
   // read only needed columns (continuous range upto max)
   var maxCol = Math.max(
@@ -139,6 +180,7 @@ function listEligible_(e) {
 
   // start from row 2 (skip header row)
   var data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+  var statesColValues = sheet.getRange(2, stateCol, lastRow - 1, 1).getValues();
   var items = [];
 
   // precompute 0-based indexes (micro-optimizations add up on large sheets)
@@ -160,11 +202,13 @@ function listEligible_(e) {
     var aq = normalizeCell_(row[idxAQ]);
     var ar = normalizeCell_(row[idxAR]);
     var approvalsValue = normalizeCell_(row[idxApproval]);
+    var statesValue = normalizeCell_(statesColValues[i][0]);
 
     var segments = buildSegments_(aq, ar);
     var approvals = splitApprovals_(approvalsValue);
+    var states = splitPipe_(statesValue);
 
-    var pendingIndex = findPendingSegmentIndex_(segments, approvals);
+    var pendingIndex = findPendingSegmentIndex_(segments, approvals, states);
     if (pendingIndex === null) continue;
 
     var segmentDocs = parseDocs_(segments[pendingIndex]);
@@ -179,6 +223,7 @@ function listEligible_(e) {
       segmentIndex: pendingIndex,
       segmentLabel: segmentLabel,
       docs: segmentDocs,
+      rowIndex: i + 2,
       raw: { aq: aq, ar: ar, approvals: approvalsValue }
     });
   }
@@ -194,6 +239,7 @@ function markChecked_(e) {
   var idToken = requireParam_(e, "id_token");
   var orderId = normalizeCell_(requireParam_(e, "orderId"));
   var segmentIndexParam = requireParam_(e, "segmentIndex");
+  var rowIndexParam = normalizeCell_(e && e.parameter && e.parameter.rowIndex);
   var files = getFiles_(e);
 
   var segmentIndex = parseInt(segmentIndexParam, 10);
@@ -203,28 +249,50 @@ function markChecked_(e) {
   var auth = verifyToken_(idToken);
   var approvalColumn = approvalColumnIndex_(auth.email);
 
+  var sheet = getSheet_();
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
+  var remarkCol = returnCols.remarkCol;
+  var returnedAtCol = returnCols.returnedAtCol;
+
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
 
   try {
-    var sheet = getSheet_();
     var lastRow = sheet.getLastRow();
     if (lastRow < 2) throw new Error("No data available");
 
-    // FAST find: no full column read
-    var finder = sheet
-      .getRange(2, COLUMN_INDEX.orderId, lastRow - 1, 1)
-      .createTextFinder(orderId)
-      .matchEntireCell(true)
-      .findNext();
+    var rowIndex = null;
+    if (rowIndexParam) {
+      var parsedRowIndex = parseInt(rowIndexParam, 10);
+      if (isNaN(parsedRowIndex) || parsedRowIndex < 2 || parsedRowIndex > lastRow) {
+        throw new Error("Invalid rowIndex");
+      }
+      rowIndex = parsedRowIndex;
+      var cellOrderId = normalizeCell_(sheet.getRange(rowIndex, COLUMN_INDEX.orderId).getValue());
+      if (cellOrderId !== orderId) throw new Error("rowIndex does not match orderId");
+    } else {
+      // FAST find: no full column read
+      var finder = sheet
+        .getRange(2, COLUMN_INDEX.orderId, lastRow - 1, 1)
+        .createTextFinder(orderId)
+        .matchEntireCell(true)
+        .findNext();
 
-    if (!finder) throw new Error("Order ID not found");
-
-    var rowIndex = finder.getRow();
+      if (!finder) throw new Error("Order ID not found");
+      rowIndex = finder.getRow();
+    }
 
     var approvalCell = sheet.getRange(rowIndex, approvalColumn);
     var approvalValue = normalizeCell_(approvalCell.getValue());
     var approvals = splitApprovals_(approvalValue);
+
+    // Validate segment exists for this row (prevents approving arbitrary indexes).
+    var aqAr = sheet.getRange(rowIndex, COLUMN_INDEX.aq, 1, 2).getValues()[0];
+    var segments = buildSegments_(normalizeCell_(aqAr[0]), normalizeCell_(aqAr[1]));
+    if (segmentIndex >= segments.length || !normalizeCell_(segments[segmentIndex])) {
+      throw new Error("Invalid segmentIndex for this order");
+    }
 
     while (approvals.length <= segmentIndex) approvals.push("");
     approvals[segmentIndex] = "Yes";
@@ -235,9 +303,113 @@ function markChecked_(e) {
     var updated = approvals.join(" | ");
     approvalCell.setValue(updated);
 
+    // Clear return markers (if any) and mark approved state
+    var states = splitPipe_(sheet.getRange(rowIndex, stateCol).getValue());
+    var remarks = splitPipe_(sheet.getRange(rowIndex, remarkCol).getValue());
+    var returnedAts = splitPipe_(sheet.getRange(rowIndex, returnedAtCol).getValue());
+
+    while (states.length <= segmentIndex) states.push("");
+    while (remarks.length <= segmentIndex) remarks.push("");
+    while (returnedAts.length <= segmentIndex) returnedAts.push("");
+
+    states[segmentIndex] = EA_SEGMENT_STATE.APPROVED;
+    remarks[segmentIndex] = "";
+    returnedAts[segmentIndex] = "";
+
+    sheet.getRange(rowIndex, stateCol).setValue(joinPipe_(states));
+    sheet.getRange(rowIndex, remarkCol).setValue(joinPipe_(remarks));
+    sheet.getRange(rowIndex, returnedAtCol).setValue(joinPipe_(returnedAts));
+
     logAction_(auth.email, orderId, segmentIndex);
 
     return { ok: true, updatedApprovals: updated };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function returnToManager_(e) {
+  var idToken = requireParam_(e, "id_token");
+  var orderId = normalizeCell_(requireParam_(e, "orderId"));
+  var segmentIndexParam = requireParam_(e, "segmentIndex");
+  var rowIndexParam = normalizeCell_(e && e.parameter && e.parameter.rowIndex);
+  var remark = normalizeCell_(requireParam_(e, "remark"));
+
+  var segmentIndex = parseInt(segmentIndexParam, 10);
+  if (isNaN(segmentIndex) || segmentIndex < 0) throw new Error("Invalid segmentIndex");
+  if (!remark || remark.length < 5) throw new Error("Remark must be at least 5 characters");
+
+  // Keep pipe-safe + bounded.
+  remark = remark.replace(/\|/g, "/").slice(0, 180);
+
+  var auth = verifyToken_(idToken);
+  var approvalColumn = approvalColumnIndex_(auth.email);
+  var sheet = getSheet_();
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
+  var remarkCol = returnCols.remarkCol;
+  var returnedAtCol = returnCols.returnedAtCol;
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) throw new Error("No data available");
+
+    var rowIndex = null;
+    if (rowIndexParam) {
+      var parsedRowIndex = parseInt(rowIndexParam, 10);
+      if (isNaN(parsedRowIndex) || parsedRowIndex < 2 || parsedRowIndex > lastRow) {
+        throw new Error("Invalid rowIndex");
+      }
+      rowIndex = parsedRowIndex;
+      var cellOrderId = normalizeCell_(sheet.getRange(rowIndex, COLUMN_INDEX.orderId).getValue());
+      if (cellOrderId !== orderId) throw new Error("rowIndex does not match orderId");
+    } else {
+      var finder = sheet
+        .getRange(2, COLUMN_INDEX.orderId, lastRow - 1, 1)
+        .createTextFinder(orderId)
+        .matchEntireCell(true)
+        .findNext();
+
+      if (!finder) throw new Error("Order ID not found");
+      rowIndex = finder.getRow();
+    }
+
+    // Don't allow returning an already approved segment.
+    var approvalValue = normalizeCell_(sheet.getRange(rowIndex, approvalColumn).getValue());
+    var approvals = splitApprovals_(approvalValue);
+    if (isApprovedYes_(approvals[segmentIndex])) throw new Error("Segment already approved");
+
+    // Validate segment exists for this row.
+    var aqAr = sheet.getRange(rowIndex, COLUMN_INDEX.aq, 1, 2).getValues()[0];
+    var segments = buildSegments_(normalizeCell_(aqAr[0]), normalizeCell_(aqAr[1]));
+    if (segmentIndex >= segments.length || !normalizeCell_(segments[segmentIndex])) {
+      throw new Error("Invalid segmentIndex for this order");
+    }
+
+    var states = splitPipe_(sheet.getRange(rowIndex, stateCol).getValue());
+    var remarks = splitPipe_(sheet.getRange(rowIndex, remarkCol).getValue());
+    var returnedAts = splitPipe_(sheet.getRange(rowIndex, returnedAtCol).getValue());
+
+    while (states.length <= segmentIndex) states.push("");
+    while (remarks.length <= segmentIndex) remarks.push("");
+    while (returnedAts.length <= segmentIndex) returnedAts.push("");
+
+    states[segmentIndex] = EA_SEGMENT_STATE.RETURNED;
+    remarks[segmentIndex] = remark;
+    returnedAts[segmentIndex] = new Date().toISOString();
+
+    sheet.getRange(rowIndex, stateCol).setValue(joinPipe_(states));
+    sheet.getRange(rowIndex, remarkCol).setValue(joinPipe_(remarks));
+    sheet.getRange(rowIndex, returnedAtCol).setValue(joinPipe_(returnedAts));
+    SpreadsheetApp.flush();
+
+    logAction_(auth.email, orderId, segmentIndex);
+    logReturnTransition_(auth.email, orderId, segmentIndex, "", EA_SEGMENT_STATE.RETURNED, remark);
+
+    return { ok: true };
   } finally {
     lock.releaseLock();
   }
@@ -272,6 +444,12 @@ function verifyToken_(idToken) {
 
   var payload = JSON.parse(response.getContentText());
   if (payload.aud !== CLIENT_ID) throw new Error("Unauthorized: invalid audience");
+  if (payload.email_verified !== undefined && String(payload.email_verified) !== "true") {
+    throw new Error("Unauthorized: email not verified");
+  }
+  if (payload.iss && payload.iss !== "accounts.google.com" && payload.iss !== "https://accounts.google.com") {
+    throw new Error("Unauthorized: invalid issuer");
+  }
 
   var email = payload.email;
   if (!APPROVAL_COLUMN_BY_EMAIL[email]) throw new Error("Unauthorized: invalid user");
@@ -319,6 +497,22 @@ function getLogSheet_() {
     sh.getRange(1, 1, 1, 5).setValues([["timestamp", "email", "orderId", "segmentIndex", "segmentLabel"]]);
   }
   __logSheet = sh;
+  return sh;
+}
+
+function getReturnLogSheet_() {
+  if (__returnLogSheet) return __returnLogSheet;
+
+  var ss = getSpreadsheet_();
+  var sh = ss.getSheetByName("Stagging_Return_Log");
+  if (!sh) {
+    sh = ss.insertSheet("Stagging_Return_Log");
+    sh
+      .getRange(1, 1, 1, 7)
+      .setValues([["timestamp", "actor", "orderId", "segmentIndex", "segmentLabel", "fromState", "toState"]]);
+    sh.getRange(1, 8).setValue("remark");
+  }
+  __returnLogSheet = sh;
   return sh;
 }
 
@@ -372,11 +566,49 @@ function splitApprovals_(value) {
   return approvals;
 }
 
-function findPendingSegmentIndex_(segments, approvals) {
+function splitPipe_(value) {
+  if (!value) return [];
+  var parts = String(value).split("|");
+  var out = [];
+  for (var i = 0; i < parts.length; i++) out.push(normalizeCell_(parts[i]));
+  return out;
+}
+
+function joinPipe_(parts) {
+  if (!parts || !parts.length) return "";
+  var out = [];
+  for (var i = 0; i < parts.length; i++) out.push(normalizeCell_(parts[i]));
+  return out.join(" | ");
+}
+
+function isApprovedYes_(value) {
+  value = normalizeCell_(value);
+  if (!value) return false;
+  return value.toLowerCase() === "yes";
+}
+
+function isReturnedState_(value) {
+  return normalizeCell_(value) === EA_SEGMENT_STATE.RETURNED;
+}
+
+function isApprovedState_(value) {
+  return normalizeCell_(value) === EA_SEGMENT_STATE.APPROVED;
+}
+
+function findPendingSegmentIndex_(segments, approvals, states) {
+  states = states || [];
+
   for (var i = 0; i < segments.length; i++) {
     var segment = normalizeCell_(segments[i]);
     if (!segment) continue;
-    if (approvals[i] !== "Yes") return i;
+
+    // Returned segments should not appear for EA until the manager clears them.
+    if (isReturnedState_(states[i])) continue;
+
+    // Approved segments are handled.
+    if (isApprovedYes_(approvals[i]) || isApprovedState_(states[i])) continue;
+
+    return i;
   }
   return null;
 }
@@ -410,6 +642,257 @@ function logAction_(email, orderId, segmentIndex) {
 
   var nextRow = logSheet.getLastRow() + 1;
   logSheet.getRange(nextRow, 1, 1, 5).setValues([[new Date(), email, orderId, segmentIndex, label]]);
+}
+
+function logReturnTransition_(actor, orderId, segmentIndex, fromState, toState, remark) {
+  var sh = getReturnLogSheet_();
+  var label = segmentIndex === 0 ? "Final" : "Additional-" + segmentIndex;
+  var nextRow = sh.getLastRow() + 1;
+  sh
+    .getRange(nextRow, 1, 1, 8)
+    .setValues([[new Date(), actor, orderId, segmentIndex, label, fromState || "", toState || "", remark || ""]]);
+}
+
+function findColumnIndexByHeader_(sheet, headerName) {
+  var key = sheet.getSheetId() + ":" + headerName;
+  if (__headerColIndexCache[key]) return __headerColIndexCache[key];
+
+  var lastCol = sheet.getLastColumn();
+  if (lastCol < 1) lastCol = 1;
+
+  var finder = sheet
+    .getRange(1, 1, 1, lastCol)
+    .createTextFinder(headerName)
+    .matchEntireCell(true)
+    .findNext();
+
+  if (!finder) return null;
+  __headerColIndexCache[key] = finder.getColumn();
+  return __headerColIndexCache[key];
+}
+
+function ensureReturnColumns_(sheet) {
+  var stateCol = findColumnIndexByHeader_(sheet, RETURN_STATE_HEADER);
+  var remarkCol = findColumnIndexByHeader_(sheet, RETURN_REMARK_HEADER);
+  var returnedAtCol = findColumnIndexByHeader_(sheet, RETURNED_AT_HEADER);
+
+  if (stateCol && remarkCol && returnedAtCol) {
+    return { stateCol: stateCol, remarkCol: remarkCol, returnedAtCol: returnedAtCol };
+  }
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    // Re-check under lock.
+    stateCol = findColumnIndexByHeader_(sheet, RETURN_STATE_HEADER);
+    remarkCol = findColumnIndexByHeader_(sheet, RETURN_REMARK_HEADER);
+    returnedAtCol = findColumnIndexByHeader_(sheet, RETURNED_AT_HEADER);
+
+    if (!stateCol) {
+      stateCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, stateCol).setValue(RETURN_STATE_HEADER);
+      __headerColIndexCache[sheet.getSheetId() + ":" + RETURN_STATE_HEADER] = stateCol;
+    }
+
+    if (!remarkCol) {
+      remarkCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, remarkCol).setValue(RETURN_REMARK_HEADER);
+      __headerColIndexCache[sheet.getSheetId() + ":" + RETURN_REMARK_HEADER] = remarkCol;
+    }
+
+    if (!returnedAtCol) {
+      returnedAtCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, returnedAtCol).setValue(RETURNED_AT_HEADER);
+      __headerColIndexCache[sheet.getSheetId() + ":" + RETURNED_AT_HEADER] = returnedAtCol;
+    }
+
+    return { stateCol: stateCol, remarkCol: remarkCol, returnedAtCol: returnedAtCol };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function listReturnedForManager_(e) {
+  var key = (e && e.parameter && e.parameter.key) || "";
+  if (!key || String(key).trim() !== DASH_KEY) {
+    throw new Error("Access denied");
+  }
+
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { ok: true, items: [] };
+
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
+  var remarkCol = returnCols.remarkCol;
+  var returnedAtCol = returnCols.returnedAtCol;
+
+  var maxCol = Math.max(
+    COLUMN_INDEX.orderId,
+    COLUMN_INDEX.crm,
+    COLUMN_INDEX.location,
+    COLUMN_INDEX.marketingPerson,
+    COLUMN_INDEX.dealerName,
+    FINAL_URL_COLUMN,
+    ADDITIONAL_URLS_COLUMN
+  );
+
+  var data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+  var statesColValues = sheet.getRange(2, stateCol, lastRow - 1, 1).getValues();
+  var remarksColValues = sheet.getRange(2, remarkCol, lastRow - 1, 1).getValues();
+  var returnedAtColValues = sheet.getRange(2, returnedAtCol, lastRow - 1, 1).getValues();
+
+  var idxOrderId = COLUMN_INDEX.orderId - 1;
+  var idxDealer = COLUMN_INDEX.dealerName - 1;
+  var idxMkt = COLUMN_INDEX.marketingPerson - 1;
+  var idxLoc = COLUMN_INDEX.location - 1;
+  var idxCrm = COLUMN_INDEX.crm - 1;
+  var idxFinalUrl = FINAL_URL_COLUMN - 1;
+  var idxAdditionalUrls = ADDITIONAL_URLS_COLUMN - 1;
+
+  var items = [];
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var orderId = normalizeCell_(row[idxOrderId]);
+    if (!orderId) continue;
+
+    var states = splitPipe_(normalizeCell_(statesColValues[i][0]));
+    if (!states.length) continue;
+
+    var remarks = splitPipe_(normalizeCell_(remarksColValues[i][0]));
+    var returnedAts = splitPipe_(normalizeCell_(returnedAtColValues[i][0]));
+
+    var finalUrl = normalizeCell_(row[idxFinalUrl]);
+    var additionalUrls = splitCsv_(normalizeCell_(row[idxAdditionalUrls]));
+
+    for (var s = 0; s < states.length; s++) {
+      if (!isReturnedState_(states[s])) continue;
+
+      var segmentIndex = s;
+      var segmentLabel = segmentIndex === 0 ? "Final" : "Additional-" + segmentIndex;
+      var segmentUrl =
+        segmentIndex === 0
+          ? finalUrl
+          : normalizeCell_(additionalUrls[segmentIndex - 1]);
+
+      items.push({
+        orderId: orderId,
+        dealerName: normalizeCell_(row[idxDealer]),
+        marketingPerson: normalizeCell_(row[idxMkt]),
+        location: normalizeCell_(row[idxLoc]),
+        crm: normalizeCell_(row[idxCrm]),
+        segmentIndex: segmentIndex,
+        segmentLabel: segmentLabel,
+        segmentUrl: segmentUrl,
+        remark: normalizeCell_((remarks && remarks[s]) || ""),
+        returnedAt: normalizeCell_((returnedAts && returnedAts[s]) || ""),
+        rowIndex: i + 2
+      });
+    }
+  }
+
+  return { ok: true, items: items };
+}
+
+function clearReturnedForManager_(e) {
+  var key = (e && e.parameter && e.parameter.key) || "";
+  if (!key || String(key).trim() !== DASH_KEY) {
+    throw new Error("Access denied");
+  }
+
+  var orderId = normalizeCell_(requireParam_(e, "orderId"));
+  var segmentIndexParam = normalizeCell_(e && e.parameter && e.parameter.segmentIndex);
+  var segmentUrl = normalizeCell_(e && e.parameter && e.parameter.segmentUrl);
+
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) throw new Error("No data available");
+
+  var returnCols = ensureReturnColumns_(sheet);
+  var stateCol = returnCols.stateCol;
+  var remarkCol = returnCols.remarkCol;
+  var returnedAtCol = returnCols.returnedAtCol;
+
+  var segmentIndex = null;
+  if (segmentIndexParam) {
+    var parsed = parseInt(segmentIndexParam, 10);
+    if (!isNaN(parsed) && parsed >= 0) segmentIndex = parsed;
+  }
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    var finder = sheet
+      .getRange(2, COLUMN_INDEX.orderId, lastRow - 1, 1)
+      .createTextFinder(orderId)
+      .matchEntireCell(true)
+      .findNext();
+
+    if (!finder) throw new Error("Order ID not found");
+    var rowIndex = finder.getRow();
+
+    if (segmentIndex === null) {
+      if (!segmentUrl) throw new Error("Missing segmentIndex or segmentUrl");
+
+      var finalUrl = normalizeCell_(sheet.getRange(rowIndex, FINAL_URL_COLUMN).getValue());
+      if (finalUrl && finalUrl === segmentUrl) {
+        segmentIndex = 0;
+      } else {
+        var additionalUrls = splitCsv_(normalizeCell_(sheet.getRange(rowIndex, ADDITIONAL_URLS_COLUMN).getValue()));
+        var pos = -1;
+        for (var i = 0; i < additionalUrls.length; i++) {
+          if (normalizeCell_(additionalUrls[i]) === segmentUrl) {
+            pos = i;
+            break;
+          }
+        }
+        if (pos === -1) throw new Error("segmentUrl not found for order");
+        segmentIndex = pos + 1;
+      }
+    }
+
+    var states = splitPipe_(sheet.getRange(rowIndex, stateCol).getValue());
+    var remarks = splitPipe_(sheet.getRange(rowIndex, remarkCol).getValue());
+    var returnedAts = splitPipe_(sheet.getRange(rowIndex, returnedAtCol).getValue());
+
+    while (states.length <= segmentIndex) states.push("");
+    while (remarks.length <= segmentIndex) remarks.push("");
+    while (returnedAts.length <= segmentIndex) returnedAts.push("");
+
+    if (!isReturnedState_(states[segmentIndex])) {
+      return { ok: true, cleared: false };
+    }
+
+    var fromState = states[segmentIndex];
+    states[segmentIndex] = EA_SEGMENT_STATE.PENDING;
+    remarks[segmentIndex] = "";
+    returnedAts[segmentIndex] = "";
+
+    sheet.getRange(rowIndex, stateCol).setValue(joinPipe_(states));
+    sheet.getRange(rowIndex, remarkCol).setValue(joinPipe_(remarks));
+    sheet.getRange(rowIndex, returnedAtCol).setValue(joinPipe_(returnedAts));
+    SpreadsheetApp.flush();
+
+    logReturnTransition_("manager", orderId, segmentIndex, fromState, EA_SEGMENT_STATE.PENDING, "");
+
+    return { ok: true, cleared: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function splitCsv_(value) {
+  if (!value) return [];
+  var parts = String(value).split(",");
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    var v = normalizeCell_(parts[i]);
+    if (v) out.push(v);
+  }
+  return out;
 }
 
 function createOutput_(callback, data) {
@@ -449,12 +932,61 @@ function normalizeEvent_(e) {
           if (body.files) merged.files = body.files;
         }
       } catch (err) {
-        // ignore JSON parse errors and fall back to query params
+        // If it's not JSON, it might be URL-encoded (some browsers send URLSearchParams as text/plain in no-cors).
+        var parsed = parseUrlEncoded_(e.postData.contents);
+        if (parsed) {
+          for (var k in parsed) {
+            if (k === "files") continue;
+            merged.parameter[k] = parsed[k];
+          }
+        }
+      }
+    } else if (contentType.indexOf("application/x-www-form-urlencoded") === 0) {
+      var parsedForm = parseUrlEncoded_(e.postData.contents);
+      if (parsedForm) {
+        for (var fk in parsedForm) {
+          if (fk === "files") continue;
+          merged.parameter[fk] = parsedForm[fk];
+        }
       }
     }
   }
 
   return merged;
+}
+
+function parseUrlEncoded_(contents) {
+  contents = String(contents || "").trim();
+  if (!contents) return null;
+  // Reject obvious JSON to avoid accidental parsing.
+  if (contents[0] === "{" || contents[0] === "[") return null;
+
+  var out = {};
+  var pairs = contents.split("&");
+  for (var i = 0; i < pairs.length; i++) {
+    var pair = pairs[i];
+    if (!pair) continue;
+    var idx = pair.indexOf("=");
+    var rawKey = idx >= 0 ? pair.slice(0, idx) : pair;
+    var rawVal = idx >= 0 ? pair.slice(idx + 1) : "";
+
+    // application/x-www-form-urlencoded uses '+' for spaces.
+    rawKey = rawKey.replace(/\+/g, " ");
+    rawVal = rawVal.replace(/\+/g, " ");
+
+    var key = "";
+    var val = "";
+    try {
+      key = decodeURIComponent(rawKey);
+      val = decodeURIComponent(rawVal);
+    } catch (e) {
+      // Skip malformed pairs.
+      continue;
+    }
+    if (!key) continue;
+    out[key] = val;
+  }
+  return out;
 }
 
 function getFiles_(e) {
