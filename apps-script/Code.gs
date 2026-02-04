@@ -4,6 +4,8 @@ var CLIENT_ID = "360849757137-agopfs0m8rgmcj541ucpg22btep5olt3.apps.googleuserco
 var MAX_ADDITIONAL_ORDERS = 4;
 var ATTACHMENTS_COLUMN = columnToIndex_("BH");
 var ATTACHMENTS_FOLDER_NAME = "ApprovedSalesOrders";
+var DASH_KEY = "EA_DASH_KEY_CHANGE_ME";
+
 
 // NOTE: mapping exactly same rakha hai (logic untouched)
 var APPROVAL_COLUMN_BY_EMAIL = {
@@ -40,7 +42,16 @@ function handleRequest_(e) {
   try {
     if (action === "listEligible") {
       result = listEligible_(e);
-    } else if (action === "markChecked") {
+    } else if (action === "COUNT_ELIGIBLE") {
+  var key = (e && e.parameter && e.parameter.key) || "";
+  if (!key || String(key).trim() !== DASH_KEY) {
+    throw new Error("Access denied");
+  }
+  // eligible list already aati hai listEligible_ me, but it requires id_token,
+  // so we need a token-less count function
+  result = countEligible_(); 
+}
+else if (action === "markChecked") {
       result = markChecked_(e);
     } else {
       throw new Error("Unknown action");
@@ -50,6 +61,52 @@ function handleRequest_(e) {
   }
 
   return createOutput_(callback, result);
+}
+
+function countEligible_() {
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { ok: true, count: 0 };
+
+  // NOTE: approvals BF column (mis01) is fixed for dashboard count
+  // (because dashboard is for EA Shaista only)
+  var approvalIndex = columnToIndex_(APPROVAL_COLUMN_BY_EMAIL["mis01@ntwoods.com"]); // BF -> 58
+  var maxCol = Math.max(
+    approvalIndex,
+    COLUMN_INDEX.orderId,
+    COLUMN_INDEX.ar,
+    COLUMN_INDEX.aq
+  );
+
+  var data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+
+  var idxOrderId = COLUMN_INDEX.orderId - 1;
+  var idxAQ = COLUMN_INDEX.aq - 1;
+  var idxAR = COLUMN_INDEX.ar - 1;
+  var idxApproval = approvalIndex - 1;
+
+  var count = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+
+    var orderId = normalizeCell_(row[idxOrderId]);
+    if (!orderId) continue;
+
+    var aq = normalizeCell_(row[idxAQ]);
+    var ar = normalizeCell_(row[idxAR]);
+    var approvalsValue = normalizeCell_(row[idxApproval]);
+
+    var segments = buildSegments_(aq, ar);
+    var approvals = splitApprovals_(approvalsValue);
+
+    var pendingIndex = findPendingSegmentIndex_(segments, approvals);
+    if (pendingIndex === null) continue;
+
+    count++;
+  }
+
+  return { ok: true, count: count };
 }
 
 // --------------------
@@ -367,7 +424,9 @@ function createOutput_(callback, data) {
 
 function requireParam_(e, name) {
   var value = e && e.parameter && e.parameter[name];
-  if (!value) throw new Error("Missing parameter: " + name);
+  if (value === undefined || value === null || value === "") {
+    throw new Error("Missing parameter: " + name);
+  }
   return value;
 }
 
